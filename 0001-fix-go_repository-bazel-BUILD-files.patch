@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Rachid Saadi <rach.saadi@gmail.com>
+Date: Tue, 3 Jan 2023 14:46:40 +0100
+Subject: fix go_repository bazel BUILD files
+
+
+diff --git a/bind/BUILD.bazel b/bind/BUILD.bazel
+index b3bc3ba..3f41a75 100644
+--- a/bind/BUILD.bazel
++++ b/bind/BUILD.bazel
+@@ -13,6 +13,9 @@ go_library(
+         "printer.go",
+         "types.go",
+     ],
++    data = [
++        "seq.go.support",
++    ],
+     importpath = "golang.org/x/mobile/bind",
+     visibility = ["//visibility:public"],
+     deps = [
+diff --git a/bind/java/BUILD.bazel b/bind/java/BUILD.bazel
+index 1248a00..b63ca8e 100644
+--- a/bind/java/BUILD.bazel
++++ b/bind/java/BUILD.bazel
+@@ -15,6 +15,10 @@ go_library(
+         ],
+         "//conditions:default": [],
+     }),
++    data = [
++        "seq_android.go.support",
++        "seq_android.c.support",
++    ],
+     importpath = "golang.org/x/mobile/bind/java",
+     visibility = ["//visibility:public"],
+     deps = select({
+diff --git a/bind/objc/BUILD.bazel b/bind/objc/BUILD.bazel
+index 8440443..ef6a3db 100644
+--- a/bind/objc/BUILD.bazel
++++ b/bind/objc/BUILD.bazel
+@@ -7,6 +7,10 @@ go_library(
+         "ref.h",
+         "seq_darwin.h",
+     ],
++    data = [
++        "seq_darwin.go.support",
++        "seq_darwin.m.support",
++    ],
+     importpath = "golang.org/x/mobile/bind/objc",
+     visibility = ["//visibility:public"],
+ )
+-- 
+2.37.1 (Apple Git-137.1)
+
