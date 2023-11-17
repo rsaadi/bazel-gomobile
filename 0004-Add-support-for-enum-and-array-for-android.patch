@@ -1,0 +1,479 @@
+From 0742aadebad47df9b94725506e1c06ffa4ab9671 Mon Sep 17 00:00:00 2001
+From: Rachid Saadi <rach.saadi@gmail.com>
+Date: Thu, 16 Nov 2023 16:56:50 +0100
+Subject: [PATCH] Add support for enum and array for android
+
+---
+ bind/genjava.go                 | 196 +++++++++++++++++++++++---------
+ bind/java/seq_android.c.support |  44 +++++++
+ bind/java/seq_android.h         |  10 ++
+ 3 files changed, 194 insertions(+), 56 deletions(-)
+
+diff --git a/bind/genjava.go b/bind/genjava.go
+index b197640..64849a2 100644
+--- a/bind/genjava.go
++++ b/bind/genjava.go
+@@ -13,6 +13,7 @@ import (
+ 	"reflect"
+ 	"regexp"
+ 	"strings"
++	"unicode"
+ 
+ 	"golang.org/x/mobile/internal/importers/java"
+ )
+@@ -318,9 +319,9 @@ func (g *JavaGen) genStruct(s structInfo) {
+ 
+ 		fdoc := doc.Member(f.Name())
+ 		g.javadoc(fdoc)
+-		g.Printf("public final native %s get%s();\n", g.javaType(f.Type()), f.Name())
++		g.Printf("public final native %s %sGet();\n", g.javaType(f.Type()), toLowerFirst(f.Name()))
+ 		g.javadoc(fdoc)
+-		g.Printf("public final native void set%s(%s v);\n\n", f.Name(), g.javaType(f.Type()))
++		g.Printf("public final native void %sSet(%s v);\n\n", toLowerFirst(f.Name()), g.javaType(f.Type()))
+ 	}
+ 
+ 	var isStringer bool
+@@ -491,9 +492,9 @@ func (g *JavaGen) genObjectMethods(n string, fields []*types.Var, isStringer boo
+ 			continue
+ 		}
+ 		nf := f.Name()
+-		g.Printf("%s this%s = get%s();\n", g.javaType(f.Type()), nf, nf)
+-		g.Printf("%s that%s = that.get%s();\n", g.javaType(f.Type()), nf, nf)
+-		if isJavaPrimitive(f.Type()) {
++		g.Printf("%s this%s = %sGet();\n", g.javaType(f.Type()), nf, toLowerFirst(nf))
++		g.Printf("%s that%s = that.%sGet();\n", g.javaType(f.Type()), nf, toLowerFirst(nf))
++		if g.isJavaPrimitive(f.Type()) {
+ 			g.Printf("if (this%s != that%s) {\n    return false;\n}\n", nf, nf)
+ 		} else {
+ 			g.Printf("if (this%s == null) {\n", nf)
+@@ -518,7 +519,7 @@ func (g *JavaGen) genObjectMethods(n string, fields []*types.Var, isStringer boo
+ 			g.Printf(", ")
+ 		}
+ 		idx++
+-		g.Printf("get%s()", f.Name())
++		g.Printf("%sGet()", toLowerFirst(f.Name()))
+ 	}
+ 	g.Printf("});\n")
+ 	g.Printf("}\n\n")
+@@ -536,7 +537,7 @@ func (g *JavaGen) genObjectMethods(n string, fields []*types.Var, isStringer boo
+ 				continue
+ 			}
+ 			n := f.Name()
+-			g.Printf(`b.append("%s:").append(get%s()).append(",");`, n, n)
++			g.Printf(`b.append("%s:").append(%sGet()).append(",");`, n, toLowerFirst(n))
+ 			g.Printf("\n")
+ 		}
+ 		g.Printf(`return b.append("}").toString();`)
+@@ -595,15 +596,18 @@ func (g *JavaGen) genInterface(iface interfaceInfo) {
+ 	g.Printf("}\n\n")
+ }
+ 
+-func isJavaPrimitive(T types.Type) bool {
+-	b, ok := T.(*types.Basic)
+-	if !ok {
+-		return false
+-	}
+-	switch b.Kind() {
+-	case types.Bool, types.Uint8, types.Float32, types.Float64,
+-		types.Int, types.Int8, types.Int16, types.Int32, types.Int64:
+-		return true
++func (g *JavaGen) isJavaPrimitive(T types.Type) bool {
++	switch T := T.(type) {
++	case *types.Basic:
++		switch T.Kind() {
++		case types.Bool, types.Uint8, types.Float32, types.Float64,
++			types.Int, types.Int8, types.Int16, types.Int32, types.Int64:
++			return true
++		}
++	case *types.Named:
++		if ok, subtype := g.isAlias(T); ok {
++			return g.isJavaPrimitive(subtype)
++		}
+ 	}
+ 	return false
+ }
+@@ -641,15 +645,22 @@ func (g *JavaGen) jniType(T types.Type) string {
+ 			return "TODO"
+ 		}
+ 	case *types.Slice:
++		switch T.Elem().(type) {
++		case *types.Pointer:
++			return "jobjectArray"
++		}
+ 		return "jbyteArray"
+-
+ 	case *types.Pointer:
+ 		if _, ok := T.Elem().(*types.Named); ok {
+ 			return g.jniType(T.Elem())
+ 		}
+ 		g.errorf("unsupported pointer to type: %s", T)
+ 	case *types.Named:
+-		return "jobject"
++		if ok, subtype := g.isAlias(T); ok {
++			return g.jniType(subtype)
++		} else {
++			return "jobject"
++		}
+ 	default:
+ 		g.errorf("unsupported jniType: %#+v, %s\n", T, T)
+ 	}
+@@ -710,21 +721,25 @@ func (g *JavaGen) javaType(T types.Type) string {
+ 		}
+ 		g.errorf("unsupported pointer to type: %s", T)
+ 	case *types.Named:
+-		n := T.Obj()
+-		nPkg := n.Pkg()
+-		if !isErrorType(T) && !g.validPkg(nPkg) {
+-			g.errorf("type %s is in %s, which is not bound", n.Name(), nPkg)
+-			break
+-		}
+-		// TODO(crawshaw): more checking here
+-		clsName := n.Name()
+-		if nPkg != g.Pkg {
+-			if clsName == JavaClassName(nPkg) {
+-				clsName += "_"
+-			}
+-			return fmt.Sprintf("%s.%s", g.javaPkgName(nPkg), clsName)
++		if ok, subtype := g.isAlias(T); ok {
++			return g.javaType(subtype)
+ 		} else {
+-			return g.javaTypeName(clsName)
++			n := T.Obj()
++			nPkg := n.Pkg()
++			if !isErrorType(T) && !g.validPkg(nPkg) {
++				g.errorf("type %s is in %s, which is not bound", n.Name(), nPkg)
++				break
++			}
++			// TODO(crawshaw): more checking here
++			clsName := n.Name()
++			if nPkg != g.Pkg {
++				if clsName == JavaClassName(nPkg) {
++					clsName += "_"
++				}
++				return fmt.Sprintf("%s.%s", g.javaPkgName(nPkg), clsName)
++			} else {
++				return g.javaTypeName(clsName)
++			}
+ 		}
+ 	default:
+ 		g.errorf("unsupported javaType: %#+v, %s\n", T, T)
+@@ -870,11 +885,11 @@ func (g *JavaGen) genVar(o *types.Var) {
+ 	doc := g.docs[o.Name()].Doc()
+ 	// setter
+ 	g.javadoc(doc)
+-	g.Printf("public static native void set%s(%s v);\n", o.Name(), jType)
++	g.Printf("public static native void %sSet(%s v);\n", toLowerFirst(o.Name()), jType)
+ 
+ 	// getter
+ 	g.javadoc(doc)
+-	g.Printf("public static native %s get%s();\n\n", jType, o.Name())
++	g.Printf("public static native %s %sGet();\n\n", jType, toLowerFirst(o.Name()))
+ }
+ 
+ // genCRetClear clears the result value from a JNI call if an exception was
+@@ -915,15 +930,28 @@ func (g *JavaGen) genJavaToC(varName string, t types.Type, mode varMode) {
+ 			default:
+ 				g.errorf("unsupported type: %s", t)
+ 			}
++		case *types.Pointer:
++			g.Printf("int32_t _%s = go_seq_from_java_array(env, %s);\n", varName, varName)
+ 		default:
+-			g.errorf("unsupported type: %s", t)
++			g.errorf("TODO: unsupported type: %s", t)
+ 		}
+ 	case *types.Named:
+-		switch u := t.Underlying().(type) {
+-		case *types.Interface:
+-			g.Printf("int32_t _%s = go_seq_to_refnum(env, %s);\n", varName, varName)
+-		default:
+-			g.errorf("unsupported named type: %s / %T", u, u)
++		if ok, subtype := g.isAlias(t); ok {
++			g.genJavaToC(varName, subtype, mode)
++		} else {
++			st := t.Underlying()
++			switch u := st.(type) {
++			case *types.Interface:
++				g.Printf("int32_t _%s = go_seq_to_refnum(env, %s);\n", varName, varName)
++			case *types.Basic:
++				if ok, subtype := g.isAlias(t); ok {
++					g.genJavaToC(varName, subtype, mode)
++				} else {
++					g.errorf("TODO: unsupported named type: %s / %T", u, u)
++				}
++			default:
++				g.errorf("TODO: unsupported named type: %s / %T", u, u)
++			}
+ 		}
+ 	case *types.Pointer:
+ 		g.Printf("int32_t _%s = go_seq_to_refnum(env, %s);\n", varName, varName)
+@@ -952,6 +980,13 @@ func (g *JavaGen) genCToJava(toName, fromName string, t types.Type, mode varMode
+ 			default:
+ 				g.errorf("unsupported type: %s", t)
+ 			}
++		case *types.Pointer:
++			switch e := e.Elem().(type) {
++			case *types.Named:
++				g.genArrayFromRefnum(toName, fromName, e, e.Obj())
++			default:
++				g.errorf("TODO: unsupported type %s", t)
++			}
+ 		default:
+ 			g.errorf("unsupported type: %s", t)
+ 		}
+@@ -965,11 +1000,21 @@ func (g *JavaGen) genCToJava(toName, fromName string, t types.Type, mode varMode
+ 			g.errorf("unsupported type %s", t)
+ 		}
+ 	case *types.Named:
+-		switch t.Underlying().(type) {
+-		case *types.Interface, *types.Pointer:
+-			g.genFromRefnum(toName, fromName, t, t.Obj())
+-		default:
+-			g.errorf("unsupported, direct named type %s", t)
++		if ok, subtype := g.isAlias(t); ok {
++			g.genCToJava(toName, fromName, subtype, mode)
++		} else {
++			switch t.Underlying().(type) {
++			case *types.Interface, *types.Pointer:
++				g.genFromRefnum(toName, fromName, t, t.Obj())
++			case *types.Basic:
++				if ok, subtype := g.isAlias(t); ok {
++					g.genCToJava(toName, fromName, subtype, mode)
++				} else {
++					g.errorf("TODO:unsupported, direct named type %s", t)
++				}
++			default:
++				g.errorf("TODO:unsupported, direct named type %s", t)
++			}
+ 		}
+ 	default:
+ 		g.Printf("%s %s = (%s)%s;\n", g.jniType(t), toName, g.jniType(t), fromName)
+@@ -993,6 +1038,23 @@ func (g *JavaGen) genFromRefnum(toName, fromName string, t types.Type, o *types.
+ 	g.Printf(");\n")
+ }
+ 
++func (g *JavaGen) genArrayFromRefnum(toName, fromName string, t types.Type, o *types.TypeName) {
++	oPkg := o.Pkg()
++	isJava := isJavaType(o.Type())
++	if !isErrorType(o.Type()) && !g.validPkg(oPkg) && !isJava {
++		g.errorf("type %s is defined in package %s, which is not bound", t, oPkg)
++		return
++	}
++	p := pkgPrefix(oPkg)
++	g.Printf("jobjectArray %s = go_seq_to_java_array(env, %s, ", toName, fromName)
++	if isJava {
++		g.Printf("NULL, NULL")
++	} else {
++		g.Printf("proxy_class_%s_%s, proxy_class_%s_%s_cons", p, o.Name(), p, o.Name())
++	}
++	g.Printf(");\n")
++}
++
+ func (g *JavaGen) gobindOpts() string {
+ 	opts := []string{"-lang=java"}
+ 	if g.JavaPkg != "" {
+@@ -1042,15 +1104,23 @@ func JavaClassName(pkg *types.Package) string {
+ }
+ 
+ func (g *JavaGen) genConst(o *types.Const) {
+-	if _, ok := o.Type().(*types.Basic); !ok || !g.isSupported(o.Type()) {
++	goType := o.Type()
++	if t, ok := goType.(*types.Named); ok {
++		if ok, subtype := g.isAlias(t); ok {
++			goType = subtype
++		}
++	}
++	if _, ok := goType.(*types.Basic); !ok || !g.isSupported(goType) {
+ 		g.Printf("// skipped const %s with unsupported type: %s\n\n", o.Name(), o.Type())
+ 		return
+ 	}
++
+ 	// TODO(hyangah): should const names use upper cases + "_"?
+ 	// TODO(hyangah): check invalid names.
+-	jType := g.javaType(o.Type())
++	jType := g.javaType(goType)
+ 	val := o.Val().ExactString()
+-	switch b := o.Type().(*types.Basic); b.Kind() {
++
++	switch b := goType.(*types.Basic); b.Kind() {
+ 	case types.Int64, types.UntypedInt:
+ 		i, exact := constant.Int64Val(o.Val())
+ 		if !exact {
+@@ -1083,7 +1153,7 @@ func (g *JavaGen) genJNIField(o *types.TypeName, f *types.Var) {
+ 	n := java.JNIMangle(g.javaTypeName(o.Name()))
+ 	// setter
+ 	g.Printf("JNIEXPORT void JNICALL\n")
+-	g.Printf("Java_%s_%s_set%s(JNIEnv *env, jobject this, %s v) {\n", g.jniPkgName(), n, java.JNIMangle(f.Name()), g.jniType(f.Type()))
++	g.Printf("Java_%s_%s_%sSet(JNIEnv *env, jobject this, %s v) {\n", g.jniPkgName(), n, toLowerFirst(java.JNIMangle(f.Name())), g.jniType(f.Type()))
+ 	g.Indent()
+ 	g.Printf("int32_t o = go_seq_to_refnum_go(env, this);\n")
+ 	g.genJavaToC("v", f.Type(), modeRetained)
+@@ -1094,7 +1164,7 @@ func (g *JavaGen) genJNIField(o *types.TypeName, f *types.Var) {
+ 
+ 	// getter
+ 	g.Printf("JNIEXPORT %s JNICALL\n", g.jniType(f.Type()))
+-	g.Printf("Java_%s_%s_get%s(JNIEnv *env, jobject this) {\n", g.jniPkgName(), n, java.JNIMangle(f.Name()))
++	g.Printf("Java_%s_%s_%sGet(JNIEnv *env, jobject this) {\n", g.jniPkgName(), n, toLowerFirst(java.JNIMangle(f.Name())))
+ 	g.Indent()
+ 	g.Printf("int32_t o = go_seq_to_refnum_go(env, this);\n")
+ 	g.Printf("%s r0 = ", g.cgoType(f.Type()))
+@@ -1113,20 +1183,20 @@ func (g *JavaGen) genJNIVar(o *types.Var) {
+ 	n := java.JNIMangle(g.javaTypeName(o.Name()))
+ 	// setter
+ 	g.Printf("JNIEXPORT void JNICALL\n")
+-	g.Printf("Java_%s_%s_set%s(JNIEnv *env, jclass clazz, %s v) {\n", g.jniPkgName(), java.JNIMangle(g.className()), n, g.jniType(o.Type()))
++	g.Printf("Java_%s_%s_%sSet(JNIEnv *env, jclass clazz, %s v) {\n", g.jniPkgName(), toLowerFirst(java.JNIMangle(g.className())), n, g.jniType(o.Type()))
+ 	g.Indent()
+ 	g.genJavaToC("v", o.Type(), modeRetained)
+-	g.Printf("var_set%s_%s(_v);\n", g.pkgPrefix, o.Name())
++	g.Printf("var_%sSet_%s(_v);\n", g.pkgPrefix, o.Name())
+ 	g.genRelease("v", o.Type(), modeRetained)
+ 	g.Outdent()
+ 	g.Printf("}\n\n")
+ 
+ 	// getter
+ 	g.Printf("JNIEXPORT %s JNICALL\n", g.jniType(o.Type()))
+-	g.Printf("Java_%s_%s_get%s(JNIEnv *env, jclass clazz) {\n", g.jniPkgName(), java.JNIMangle(g.className()), n)
++	g.Printf("Java_%s_%s_%sGet(JNIEnv *env, jclass clazz) {\n", g.jniPkgName(), toLowerFirst(java.JNIMangle(g.className())), n)
+ 	g.Indent()
+ 	g.Printf("%s r0 = ", g.cgoType(o.Type()))
+-	g.Printf("var_get%s_%s();\n", g.pkgPrefix, o.Name())
++	g.Printf("var_%sGet_%s();\n", toLowerFirst(g.pkgPrefix), o.Name())
+ 	g.genCToJava("_r0", "r0", o.Type(), modeRetained)
+ 	g.Printf("return _r0;\n")
+ 	g.Outdent()
+@@ -1396,7 +1466,11 @@ func (g *JavaGen) jniCallType(t types.Type) string {
+ 		}
+ 		g.errorf("unsupported pointer to type: %s", t)
+ 	case *types.Named:
+-		return "Object"
++		if ok, subtype := g.isAlias(t); ok {
++			return g.jniCallType(subtype)
++		} else {
++			return "Object"
++		}
+ 	default:
+ 		return "Object"
+ 	}
+@@ -1446,7 +1520,11 @@ func (g *JavaGen) jniSigType(T types.Type) string {
+ 		}
+ 		g.errorf("unsupported pointer to type: %s", T)
+ 	case *types.Named:
+-		return "L" + g.jniClassSigPrefix(T.Obj().Pkg()) + g.javaTypeName(T.Obj().Name()) + ";"
++		if ok, subtype := g.isAlias(T); ok {
++			return g.jniSigType(subtype)
++		} else {
++			return "L" + g.jniClassSigPrefix(T.Obj().Pkg()) + g.javaTypeName(T.Obj().Name()) + ";"
++		}
+ 	default:
+ 		g.errorf("unsupported jniType: %#+v, %s\n", T, T)
+ 	}
+@@ -1700,6 +1778,12 @@ func isJavaType(t types.Type) bool {
+ 	return typePkgFirstElem(t) == "Java"
+ }
+ 
++func toLowerFirst(MyStr string) string {
++	runes := []rune(MyStr)
++	runes[0] = unicode.ToLower(runes[0])
++	return string(runes)
++}
++
+ const (
+ 	javaPreamble = gobindPreamble + `// Java class %[1]s.%[2]s is a proxy for talking to a Go program.
+ //
+diff --git a/bind/java/seq_android.c.support b/bind/java/seq_android.c.support
+index 77ec5f4..7496ea9 100644
+--- a/bind/java/seq_android.c.support
++++ b/bind/java/seq_android.c.support
+@@ -93,6 +93,27 @@ jbyteArray go_seq_to_java_bytearray(JNIEnv *env, nbyteslice s, int copy) {
+ 	return res;
+ }
+ 
++jobjectArray go_seq_to_java_array(JNIEnv *env, int32_t refnum, jclass proxy_class, jmethodID proxy_cons) {
++    IncGoRef(refnum);
++    int size = proxyseq_array_wrapper_length(refnum);
++	jobjectArray res = (*env)->NewObjectArray(env, size, proxy_class, NULL);
++
++	if (res == NULL) {
++		LOG_FATAL("NewObjectArray failed");
++	}
++
++    for (int i = 0; i < size; i++) {
++        if (i < size - 1) {
++            IncGoRef(refnum);
++        }
++        int32_t objectId = proxyseq_array_wrapper_value_at_index(refnum, i);
++        (*env)->SetObjectArrayElement(env, res, i, go_seq_from_refnum(env, objectId, proxy_class, proxy_cons));
++    }
++
++	return res;
++}
++
++
+ #define surr1 0xd800
+ #define surr2 0xdc00
+ #define surr3 0xe000
+@@ -224,6 +245,29 @@ nbyteslice go_seq_from_java_bytearray(JNIEnv *env, jbyteArray arr, int copy) {
+ 	return res;
+ }
+ 
++int32_t go_seq_from_java_array(JNIEnv *env, jobjectArray arr) {
++    int32_t refnum = new_go_array_wrapper();
++
++	if (arr == NULL) {
++		return refnum;
++	}
++
++	jsize len = (*env)->GetArrayLength(env, arr);
++	if (len == 0) {
++		return refnum;
++	}
++
++	for (int i = 0; i < len; i++) {
++	    LOG_INFO("test 10");
++	    int32_t objectId = go_seq_to_refnum_go(env, (*env)->GetObjectArrayElement(env, arr, i));
++	    IncGoRef(refnum);
++	    proxyseq_array_wrapper_append_ref_value(refnum, objectId);
++	    LOG_INFO("test 11");
++	}
++
++	return refnum;
++}
++
+ int32_t go_seq_to_refnum_go(JNIEnv *env, jobject o) {
+ 	if (o == NULL) {
+ 		return NULL_REFNUM;
+diff --git a/bind/java/seq_android.h b/bind/java/seq_android.h
+index 26e9025..1110043 100644
+--- a/bind/java/seq_android.h
++++ b/bind/java/seq_android.h
+@@ -26,10 +26,17 @@ typedef struct nstring {
+ 	// length in bytes, regardless of encoding
+ 	jsize len;
+ } nstring;
++
+ typedef struct nbyteslice {
+ 	void *ptr;
+ 	jsize len;
+ } nbyteslice;
++
++typedef struct nobjectslice {
++	int32_t *ptr;
++	jsize len;
++} nobjectslice;
++
+ typedef jlong nint;
+ 
+ extern void go_seq_dec_ref(int32_t ref);
+@@ -52,6 +59,9 @@ extern void go_seq_release_byte_array(JNIEnv *env, jbyteArray arr, jbyte* ptr);
+ extern jstring go_seq_to_java_string(JNIEnv *env, nstring str);
+ extern nstring go_seq_from_java_string(JNIEnv *env, jstring s);
+ 
++extern jobjectArray go_seq_to_java_array(JNIEnv *env, int32_t refnum, jclass proxy_class, jmethodID proxy_cons);
++extern int32_t go_seq_from_java_array(JNIEnv *env, jobjectArray array);
++
+ // push_local_frame retrieves or creates the JNIEnv* for the current thread
+ // and pushes a JNI reference frame. Must be matched with call to pop_local_frame.
+ extern JNIEnv *go_seq_push_local_frame(jint cap);
+-- 
+2.39.3 (Apple Git-145)
+

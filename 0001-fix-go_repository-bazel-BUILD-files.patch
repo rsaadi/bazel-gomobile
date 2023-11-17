@@ -1,8 +1,13 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From dd536d9d04ff38979b03998cd7c28d27e7288e20 Mon Sep 17 00:00:00 2001
 From: Rachid Saadi <rach.saadi@gmail.com>
-Date: Tue, 3 Jan 2023 14:46:40 +0100
-Subject: fix go_repository bazel BUILD files
+Date: Fri, 17 Nov 2023 17:17:02 +0100
+Subject: [PATCH] add fix to bazel build files
 
+---
+ bind/BUILD.bazel      | 3 +++
+ bind/java/BUILD.bazel | 5 +++++
+ bind/objc/BUILD.bazel | 4 ++++
+ 3 files changed, 12 insertions(+)
 
 diff --git a/bind/BUILD.bazel b/bind/BUILD.bazel
 index b3bc3ba..3f41a75 100644
@@ -19,14 +24,15 @@ index b3bc3ba..3f41a75 100644
      visibility = ["//visibility:public"],
      deps = [
 diff --git a/bind/java/BUILD.bazel b/bind/java/BUILD.bazel
-index 1248a00..b63ca8e 100644
+index 1248a00..86a8a3a 100644
 --- a/bind/java/BUILD.bazel
 +++ b/bind/java/BUILD.bazel
-@@ -15,6 +15,10 @@ go_library(
+@@ -15,6 +15,11 @@ go_library(
          ],
          "//conditions:default": [],
      }),
 +    data = [
++        "Seq.java",
 +        "seq_android.go.support",
 +        "seq_android.c.support",
 +    ],
@@ -49,5 +55,5 @@ index 8440443..ef6a3db 100644
      visibility = ["//visibility:public"],
  )
 -- 
-2.37.1 (Apple Git-137.1)
+2.39.3 (Apple Git-145)
 

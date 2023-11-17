@@ -12,6 +12,7 @@ def _gomobile_binary_impl(ctx):
         "CGO_ENABLED": "1",
         "GOCACHE": "${PWD}",
         "GO111MODULE": "off",
+        "ANDROID_HOME": paths.join("${PWD}", "external/androidsdk"),
         "GOPATH": paths.join("${PWD}", gopath.gopath_file.dirname),
         "GOROOT": paths.join("${PWD}", go.sdk_root.dirname),
         "PATH": ":".join([
@@ -22,9 +23,6 @@ def _gomobile_binary_impl(ctx):
             "${PATH}",
         ]),
     })
-
-    src = ctx.actions.declare_file("src.txt")
-    ctx.actions.write(src, "nothin")
 
     target = ctx.attr.target
 
@@ -37,21 +35,20 @@ def _gomobile_binary_impl(ctx):
     androidParams = []
     flags = ctx.attr.flags
 
-    if target == "android" :
-        output = ctx.actions.declare_directory(ctx.attr.name + ".aar")
-        if ctx.attr.bootclasspath :
+    if target == "android":
+        output = ctx.actions.declare_file(ctx.attr.name + ".aar")
+        if ctx.attr.bootclasspath:
             androidParams.append("-bootclasspath " + ctx.attr.bootclasspath)
-        if ctx.attr.classpath :
+        if ctx.attr.classpath:
             androidParams.append("-classpath " + ctx.attr.classpath)
-    else :
+    else:
         output = ctx.actions.declare_directory(ctx.attr.name + ".xcframework")
 
     commands = [
         " && ".join(["export %s=\"%s\"" % (k, v) for k, v in env.items()]),
         ctx.executable._gomobile.path + " bind -target " + target + " ".join(androidParams) + " ".join(flags) + " -o " + output.path + " " + " ".join(packages),
+        "chmod -R 777 " + output.path,
     ]
-
-    print(commands)
 
     ctx.actions.run_shell(
         inputs = ctx.attr.go_path.files,
@@ -93,8 +90,8 @@ _gomobile_library = rule(
             providers = [GoLibrary],
         ),
         "extrapackages": attr.string_list(
-             mandatory = False,
-             default = [],
+            mandatory = False,
+            default = [],
         ),
         "go_path": attr.label(
             mandatory = True,
@@ -122,6 +119,9 @@ _gomobile_library = rule(
             allow_single_file = True,
             executable = True,
             cfg = "exec",
+        ),
+        "_androidsdk": attr.label(
+            default = "@bazel_tools//tools/android:sdk",
         ),
     },
     output_to_genfiles = True,
@@ -153,7 +153,6 @@ def gomobile_mac_library(
         flags = [],
         deps = [GoLibrary],
         extrapackages = []):
-
     target = "macos"
     if catalyst:
         target = "maccatalyst"
@@ -173,7 +172,6 @@ def gomobile_ios_library(
         flags = [],
         deps = [GoLibrary],
         extrapackages = []):
-
     target = "ios"
     if sim_only:
         target = "iossimulator"

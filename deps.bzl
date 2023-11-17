@@ -8,7 +8,10 @@ def gobind_dependencies(gomobile_repo_name):
         version = "v0.0.0-20230922142353-e2f452493d57",
         patch_tool = "git",
         patch_args = ["apply"],
-        patches = [gomobile_repo_name + "//:0001-fix-go_repository-bazel-BUILD-files.patch",
-                   gomobile_repo_name + "//:0002-add-support-for-go-enum-to-ios.patch",
-                   gomobile_repo_name + "//:0003-add-support-for-array-to-ios.patch"],
+        patches = [
+            gomobile_repo_name + "//:0001-fix-go_repository-bazel-BUILD-files.patch",
+            gomobile_repo_name + "//:0002-add-support-for-go-enum-to-ios.patch",
+            gomobile_repo_name + "//:0003-add-support-for-array-to-ios.patch",
+            gomobile_repo_name + "//:0004-Add-support-for-enum-and-array-for-android.patch",
+        ],
     )
