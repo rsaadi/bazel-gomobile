@@ -1,13 +1,13 @@
-From 0742aadebad47df9b94725506e1c06ffa4ab9671 Mon Sep 17 00:00:00 2001
+From 8e95aa4ef885d56d9ddeed9d44c13a433168458e Mon Sep 17 00:00:00 2001
 From: Rachid Saadi <rach.saadi@gmail.com>
-Date: Thu, 16 Nov 2023 16:56:50 +0100
+Date: Tue, 5 Dec 2023 16:26:44 +0400
 Subject: [PATCH] Add support for enum and array for android
 
 ---
  bind/genjava.go                 | 196 +++++++++++++++++++++++---------
- bind/java/seq_android.c.support |  44 +++++++
+ bind/java/seq_android.c.support |  48 ++++++++
  bind/java/seq_android.h         |  10 ++
- 3 files changed, 194 insertions(+), 56 deletions(-)
+ 3 files changed, 198 insertions(+), 56 deletions(-)
 
 diff --git a/bind/genjava.go b/bind/genjava.go
 index b197640..64849a2 100644
@@ -381,14 +381,18 @@ index b197640..64849a2 100644
  	javaPreamble = gobindPreamble + `// Java class %[1]s.%[2]s is a proxy for talking to a Go program.
  //
 diff --git a/bind/java/seq_android.c.support b/bind/java/seq_android.c.support
-index 77ec5f4..7496ea9 100644
+index 77ec5f4..ee19aed 100644
 --- a/bind/java/seq_android.c.support
 +++ b/bind/java/seq_android.c.support
-@@ -93,6 +93,27 @@ jbyteArray go_seq_to_java_bytearray(JNIEnv *env, nbyteslice s, int copy) {
+@@ -93,6 +93,31 @@ jbyteArray go_seq_to_java_bytearray(JNIEnv *env, nbyteslice s, int copy) {
  	return res;
  }
  
 +jobjectArray go_seq_to_java_array(JNIEnv *env, int32_t refnum, jclass proxy_class, jmethodID proxy_cons) {
++    if (refnum == NULL_REFNUM) {
++		return NULL;
++	}
++
 +    IncGoRef(refnum);
 +    int size = proxyseq_array_wrapper_length(refnum);
 +	jobjectArray res = (*env)->NewObjectArray(env, size, proxy_class, NULL);
@@ -412,7 +416,7 @@ index 77ec5f4..7496ea9 100644
  #define surr1 0xd800
  #define surr2 0xdc00
  #define surr3 0xe000
-@@ -224,6 +245,29 @@ nbyteslice go_seq_from_java_bytearray(JNIEnv *env, jbyteArray arr, int copy) {
+@@ -224,6 +249,29 @@ nbyteslice go_seq_from_java_bytearray(JNIEnv *env, jbyteArray arr, int copy) {
  	return res;
  }
  
