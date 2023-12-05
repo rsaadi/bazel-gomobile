@@ -128,8 +128,8 @@ _gomobile_library = rule(
     toolchains = ["@io_bazel_rules_go//go:toolchain"],
 )
 
-def _go_path(deps = [GoLibrary]):
-    gopath_lib = "gopath_libs"
+def _go_path(name, deps = [GoLibrary]):
+    gopath_lib = "gopath_libs" + name
 
     go_path(
         name = gopath_lib,
@@ -163,7 +163,7 @@ def gomobile_mac_library(
         flags = flags,
         deps = deps,
         extrapackages = extrapackages,
-        go_path = _go_path(deps),
+        go_path = _go_path(name, deps),
     )
 
 def gomobile_ios_library(
@@ -182,7 +182,7 @@ def gomobile_ios_library(
         flags = flags,
         deps = deps,
         extrapackages = extrapackages,
-        go_path = _go_path(deps),
+        go_path = _go_path(name, deps),
     )
 
 def gomobile_android_library(
@@ -201,5 +201,5 @@ def gomobile_android_library(
         flags = flags,
         deps = deps,
         extrapackages = extrapackages,
-        go_path = _go_path(deps),
+        go_path = _go_path(name, deps),
     )
