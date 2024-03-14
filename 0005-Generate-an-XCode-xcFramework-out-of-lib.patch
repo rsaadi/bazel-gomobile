@@ -1,0 +1,172 @@
+From 9a9d1cdcf0b3c4c15eedf2623475d48a1564db31 Mon Sep 17 00:00:00 2001
+From: Rachid Saadi <rach.saadi@gmail.com>
+Date: Thu, 14 Mar 2024 10:58:53 +0400
+Subject: [PATCH] Generate an XCode xcFramework out of lib instead of hand made
+ frameworks
+
+---
+ cmd/gomobile/bind_iosapp.go | 64 +++++++++++++------------------------
+ 1 file changed, 22 insertions(+), 42 deletions(-)
+
+diff --git a/cmd/gomobile/bind_iosapp.go b/cmd/gomobile/bind_iosapp.go
+index 3843743..3512403 100644
+--- a/cmd/gomobile/bind_iosapp.go
++++ b/cmd/gomobile/bind_iosapp.go
+@@ -149,14 +149,12 @@ func goAppleBind(gobind string, pkgs []*packages.Package, targets []targetInfo)
+ 		frameworkDirs = append(frameworkDirs, frameworkDir)
+ 		frameworkArchCount[frameworkDir] = frameworkArchCount[frameworkDir] + 1
+ 
+-		versionsDir := filepath.Join(frameworkDir, "Versions")
+-		versionsADir := filepath.Join(versionsDir, "A")
+-		titlePath := filepath.Join(versionsADir, title)
++		libPath := filepath.Join(frameworkDir, title+".a")
+ 		if frameworkArchCount[frameworkDir] > 1 {
+ 			// Not the first static lib, attach to a fat library and skip create headers
+ 			fatCmd := exec.Command(
+ 				"xcrun",
+-				"lipo", appleArchiveFilepath(name, t), titlePath, "-create", "-output", titlePath,
++				"lipo", appleArchiveFilepath(name, t), libPath, "-create", "-output", libPath,
+ 			)
+ 			if err := runCmd(fatCmd); err != nil {
+ 				return err
+@@ -164,28 +162,23 @@ func goAppleBind(gobind string, pkgs []*packages.Package, targets []targetInfo)
+ 			continue
+ 		}
+ 
+-		versionsAHeadersDir := filepath.Join(versionsADir, "Headers")
+-		if err := mkdir(versionsAHeadersDir); err != nil {
+-			return err
+-		}
+-		if err := symlink("A", filepath.Join(versionsDir, "Current")); err != nil {
+-			return err
+-		}
+-		if err := symlink("Versions/Current/Headers", filepath.Join(frameworkDir, "Headers")); err != nil {
+-			return err
+-		}
+-		if err := symlink(filepath.Join("Versions/Current", title), filepath.Join(frameworkDir, title)); err != nil {
++		if err := mkdir(frameworkDir); err != nil {
+ 			return err
+ 		}
+ 
+ 		lipoCmd := exec.Command(
+ 			"xcrun",
+-			"lipo", appleArchiveFilepath(name, t), "-create", "-o", titlePath,
++			"lipo", appleArchiveFilepath(name, t), "-create", "-o", libPath,
+ 		)
+ 		if err := runCmd(lipoCmd); err != nil {
+ 			return err
+ 		}
+ 
++		headersDir := filepath.Join(frameworkDir, "Headers")
++		if err := mkdir(headersDir); err != nil {
++			return err
++		}
++
+ 		fileBases := make([]string, len(pkgs)+1)
+ 		for i, pkg := range pkgs {
+ 			fileBases[i] = bindPrefix + strings.Title(pkg.Name)
+@@ -197,7 +190,7 @@ func goAppleBind(gobind string, pkgs []*packages.Package, targets []targetInfo)
+ 		if len(fileBases) == 1 {
+ 			headerFiles = append(headerFiles, title+".h")
+ 			err := copyFile(
+-				filepath.Join(versionsAHeadersDir, title+".h"),
++				filepath.Join(headersDir, title+".h"),
+ 				filepath.Join(gobindDir, bindPrefix+title+".objc.h"),
+ 			)
+ 			if err != nil {
+@@ -207,7 +200,7 @@ func goAppleBind(gobind string, pkgs []*packages.Package, targets []targetInfo)
+ 			for _, fileBase := range fileBases {
+ 				headerFiles = append(headerFiles, fileBase+".objc.h")
+ 				err := copyFile(
+-					filepath.Join(versionsAHeadersDir, fileBase+".objc.h"),
++					filepath.Join(headersDir, fileBase+".objc.h"),
+ 					filepath.Join(gobindDir, fileBase+".objc.h"),
+ 				)
+ 				if err != nil {
+@@ -215,14 +208,14 @@ func goAppleBind(gobind string, pkgs []*packages.Package, targets []targetInfo)
+ 				}
+ 			}
+ 			err := copyFile(
+-				filepath.Join(versionsAHeadersDir, "ref.h"),
++				filepath.Join(headersDir, "ref.h"),
+ 				filepath.Join(gobindDir, "ref.h"),
+ 			)
+ 			if err != nil {
+ 				return err
+ 			}
+ 			headerFiles = append(headerFiles, title+".h")
+-			err = writeFile(filepath.Join(versionsAHeadersDir, title+".h"), func(w io.Writer) error {
++			err = writeFile(filepath.Join(headersDir, title+".h"), func(w io.Writer) error {
+ 				return appleBindHeaderTmpl.Execute(w, map[string]interface{}{
+ 					"pkgs": pkgs, "title": title, "bases": fileBases,
+ 				})
+@@ -232,20 +225,6 @@ func goAppleBind(gobind string, pkgs []*packages.Package, targets []targetInfo)
+ 			}
+ 		}
+ 
+-		if err := mkdir(filepath.Join(versionsADir, "Resources")); err != nil {
+-			return err
+-		}
+-		if err := symlink("Versions/Current/Resources", filepath.Join(frameworkDir, "Resources")); err != nil {
+-			return err
+-		}
+-		err = writeFile(filepath.Join(frameworkDir, "Resources", "Info.plist"), func(w io.Writer) error {
+-			_, err := w.Write([]byte(appleBindInfoPlist))
+-			return err
+-		})
+-		if err != nil {
+-			return err
+-		}
+-
+ 		var mmVals = struct {
+ 			Module  string
+ 			Headers []string
+@@ -253,16 +232,12 @@ func goAppleBind(gobind string, pkgs []*packages.Package, targets []targetInfo)
+ 			Module:  title,
+ 			Headers: headerFiles,
+ 		}
+-		err = writeFile(filepath.Join(versionsADir, "Modules", "module.modulemap"), func(w io.Writer) error {
++		err = writeFile(filepath.Join(headersDir, "module.modulemap"), func(w io.Writer) error {
+ 			return appleModuleMapTmpl.Execute(w, mmVals)
+ 		})
+ 		if err != nil {
+ 			return err
+ 		}
+-		err = symlink(filepath.Join("Versions/Current/Modules"), filepath.Join(frameworkDir, "Modules"))
+-		if err != nil {
+-			return err
+-		}
+ 	}
+ 
+ 	// Finally combine all frameworks to an XCFramework
+@@ -273,11 +248,16 @@ func goAppleBind(gobind string, pkgs []*packages.Package, targets []targetInfo)
+ 		// And in gomobile, a temporary directory is usually used as a working directly.
+ 		// Unfortunately, xcodebuild in Xcode 15 seems to have a bug and might not be able to understand fullpaths with symbolic links.
+ 		// As a workaround, resolve the path with symbolic links by filepath.EvalSymlinks.
+-		dir, err := filepath.EvalSymlinks(dir)
++		frameworkDir, err := filepath.EvalSymlinks(dir)
+ 		if err != nil {
+ 			return err
+ 		}
+-		xcframeworkArgs = append(xcframeworkArgs, "-framework", dir)
++
++		libPath := filepath.Join(frameworkDir, title+".a")
++		headersPath := filepath.Join(frameworkDir, "Headers")
++
++		xcframeworkArgs = append(xcframeworkArgs, "-library", libPath)
++		xcframeworkArgs = append(xcframeworkArgs, "-headers", headersPath)
+ 	}
+ 
+ 	xcframeworkArgs = append(xcframeworkArgs, "-output", buildO)
+@@ -294,7 +274,7 @@ const appleBindInfoPlist = `<?xml version="1.0" encoding="UTF-8"?>
+     </plist>
+ `
+ 
+-var appleModuleMapTmpl = template.Must(template.New("iosmmap").Parse(`framework module "{{.Module}}" {
++var appleModuleMapTmpl = template.Must(template.New("iosmmap").Parse(`module "{{.Module}}" {
+ 	header "ref.h"
+ {{range .Headers}}    header "{{.}}"
+ {{end}}
+-- 
+2.39.3 (Apple Git-146)
+

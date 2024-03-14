@@ -47,7 +47,6 @@ def _gomobile_binary_impl(ctx):
     commands = [
         " && ".join(["export %s=\"%s\"" % (k, v) for k, v in env.items()]),
         ctx.executable._gomobile.path + " bind -target " + target + " ".join(androidParams) + " ".join(flags) + " -o " + output.path + " " + " ".join(packages),
-        "chmod -R 777 " + output.path,
     ]
 
     ctx.actions.run_shell(
@@ -55,7 +54,7 @@ def _gomobile_binary_impl(ctx):
         outputs = [output],
         command = " && ".join(commands),
         arguments = [],
-        progress_message = "Generating mobile archive ...",
+        progress_message = "Generating mobile archive " + output.path + " ...",
         mnemonic = "bind",
         tools = [
             go.go,
