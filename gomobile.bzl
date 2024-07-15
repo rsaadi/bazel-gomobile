@@ -46,7 +46,7 @@ def _gomobile_binary_impl(ctx):
 
     commands = [
         " && ".join(["export %s=\"%s\"" % (k, v) for k, v in env.items()]),
-        ctx.executable._gomobile.path + " bind -target " + target + " ".join(androidParams) + " ".join(flags) + " -o " + output.path + " " + " ".join(packages),
+        ctx.executable._gomobile.path + " bind -target " + target + " ".join(androidParams) + " " + " ".join(flags) + " -o " + output.path + " " + " ".join(packages),
     ]
 
     ctx.actions.run_shell(
