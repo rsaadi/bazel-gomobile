@@ -8,11 +8,12 @@ def _gomobile_binary_impl(ctx):
     go = go_context(ctx)
     gopath = ctx.attr.go_path[GoPath]
 
+    print("android_home conf =", ctx.configuration.default_shell_env)
     env = dicts.add(go.env, {
         "CGO_ENABLED": "1",
         "GOCACHE": "${PWD}",
         "GO111MODULE": "off",
-        "ANDROID_HOME": paths.join("${PWD}", "external/androidsdk"),
+        "GODEBUG": "embedfollowsymlinks=1",
         "GOPATH": paths.join("${PWD}", gopath.gopath_file.dirname),
         "GOROOT": paths.join("${PWD}", go.sdk_root.dirname),
         "PATH": ":".join([
@@ -56,12 +57,13 @@ def _gomobile_binary_impl(ctx):
         arguments = [],
         progress_message = "Generating mobile archive " + output.path + " ...",
         mnemonic = "bind",
-        tools = [
+        use_default_shell_env = True,
+        tools = depset(transitive = [depset([
             go.go,
             ctx.executable._gomobile,
             ctx.executable._gobind,
             ctx.executable._zipper,
-        ] + go.sdk.tools + go.sdk.srcs + go.sdk.headers,
+        ]), go.sdk.tools, go.sdk.srcs, go.sdk.headers]),
     )
 
     return [DefaultInfo(files = depset([output]))]
@@ -97,19 +99,19 @@ _gomobile_library = rule(
             providers = [GoPath],
         ),
         "_gomobile": attr.label(
-            default = Label("@org_golang_x_gomobile//cmd/gomobile:gomobile"),
+            default = Label("@org_golang_x_mobile//cmd/gomobile:gomobile"),
             allow_single_file = True,
             executable = True,
             cfg = "exec",
         ),
         "_gobind": attr.label(
-            default = Label("@org_golang_x_gomobile//cmd/gobind:gobind"),
+            default = Label("@org_golang_x_mobile//cmd/gobind:gobind"),
             allow_single_file = True,
             executable = True,
             cfg = "exec",
         ),
         "_bind": attr.label(
-            default = Label("@org_golang_x_gomobile//bind"),
+            default = Label("@org_golang_x_mobile//bind"),
             allow_single_file = True,
             cfg = "target",
         ),
@@ -120,7 +122,7 @@ _gomobile_library = rule(
             cfg = "exec",
         ),
         "_androidsdk": attr.label(
-            default = "@bazel_tools//tools/android:sdk",
+            default = "@androidsdk//:sdk",
         ),
     },
     output_to_genfiles = True,
@@ -136,10 +138,10 @@ def _go_path(name, deps = [GoLibrary]):
         include_pkg = True,
         include_transitive = True,
         deps = deps + [
-            "@org_golang_x_gomobile//bind",
-            "@org_golang_x_gomobile//bind/objc",
-            "@org_golang_x_gomobile//bind/java",
-            "@org_golang_x_gomobile//bind/seq",
+            "@org_golang_x_mobile//bind",
+            "@org_golang_x_mobile//bind/objc",
+            "@org_golang_x_mobile//bind/java",
+            "@org_golang_x_mobile//bind/seq",
         ],
         tags = ["manual"],
     )
