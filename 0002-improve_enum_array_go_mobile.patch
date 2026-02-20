@@ -1,0 +1,1113 @@
+diff --git a/bind/gen.go b/bind/gen.go
+index 18c8037..a91af39 100644
+--- a/bind/gen.go
++++ b/bind/gen.go
+@@ -71,6 +71,14 @@ type structInfo struct {
+ 	t   *types.Struct
+ }
+ 
++// aliasInfo comes from Init and collects the auxiliary information
++// needed to generate bindings for an exported Go enum/const in a bound
++// package.
++type aliasInfo struct {
++	obj *types.TypeName
++	t   *types.Basic
++}
++
+ // Generator contains the common Go package information
+ // needed for the specific Go, Java, ObjC generators.
+ //
+@@ -94,6 +102,7 @@ type Generator struct {
+ 
+ 	interfaces []interfaceInfo
+ 	structs    []structInfo
++	aliases    []aliasInfo
+ 	otherNames []*types.TypeName
+ 	// allIntf contains interfaces from all bound packages.
+ 	allIntf []interfaceInfo
+@@ -155,6 +164,12 @@ func (g *Generator) Init() {
+ 					g.structs = append(g.structs, structInfo{obj, t})
+ 				case *types.Interface:
+ 					g.interfaces = append(g.interfaces, interfaceInfo{obj, t, makeIfaceSummary(t)})
++				case *types.Basic:
++					if g.isSupported(t) {
++						g.aliases = append(g.aliases, aliasInfo{obj, t})
++					} else {
++						g.otherNames = append(g.otherNames, obj)
++					}
+ 				default:
+ 					g.otherNames = append(g.otherNames, obj)
+ 				}
+@@ -396,15 +411,25 @@ func (g *Generator) cgoType(t types.Type) string {
+ 	case *types.Slice:
+ 		if isBytesSlice(t) {
+ 			return "nbyteslice"
++		} else {
++			switch t.Elem().(type) {
++			case *types.Pointer:
++				return "int32_t"
++			default:
++				g.errorf("unsupported slice type: %s", t)
++			}
+ 		}
+-		g.errorf("unsupported slice type: %s", t)
+ 	case *types.Pointer:
+ 		if _, ok := types.Unalias(t.Elem()).(*types.Named); ok {
+ 			return g.cgoType(t.Elem())
+ 		}
+ 		g.errorf("unsupported pointer to type: %s", t)
+ 	case *types.Named:
+-		return "int32_t"
++		if ok, aType := g.isAlias(t); ok {
++			return g.cgoType(aType)
++		} else {
++			return "int32_t"
++		}
+ 	default:
+ 		g.errorf("unsupported type: %s", t)
+ 	}
+@@ -476,6 +501,15 @@ func (g *Generator) isSigSupported(t types.Type) bool {
+ 	return true
+ }
+ 
++func (g *Generator) isAlias(t *types.Named) (bool, *types.Basic) {
++	for _, a := range g.aliases {
++		if a.obj.Type() == t {
++			return true, a.t
++		}
++	}
++	return false, nil
++}
++
+ // isSupported reports whether the generators can handle the type.
+ func (g *Generator) isSupported(t types.Type) bool {
+ 	if isErrorType(t) || isWrapperType(t) {
+@@ -497,7 +531,16 @@ func (g *Generator) isSupported(t types.Type) bool {
+ 		}
+ 		return false
+ 	case *types.Slice:
+-		return isBytesSlice(t)
++		if isBytesSlice(t) {
++			return true
++		} else {
++			switch e := t.Elem().(type) {
++			case *types.Pointer:
++				return g.isSupported(e)
++			default:
++				return false
++			}
++		}
+ 	case *types.Pointer:
+ 		switch t := types.Unalias(t.Elem()).(type) {
+ 		case *types.Named:
+@@ -507,6 +550,9 @@ func (g *Generator) isSupported(t types.Type) bool {
+ 		switch t.Underlying().(type) {
+ 		case *types.Interface, *types.Pointer:
+ 			return g.validPkg(t.Obj().Pkg())
++		case *types.Basic:
++			ok, _ := g.isAlias(t)
++			return ok
+ 		}
+ 	}
+ 	return false
+diff --git a/bind/gengo.go b/bind/gengo.go
+index e374b03..b3dcace 100644
+--- a/bind/gengo.go
++++ b/bind/gengo.go
+@@ -114,8 +114,22 @@ func (g *goGen) genWrite(toVar, fromVar string, t types.Type, mode varMode) {
+ 		if isBytesSlice(t) {
+ 			g.Printf("%s := fromSlice(%s, %v)\n", toVar, fromVar, mode == modeRetained)
+ 			return
++		} else {
++			switch e := t.Elem().(type) {
++			case *types.Pointer:
++				switch u := e.Elem().(type) {
++				case *types.Named:
++					o := u.Obj()
++					oPkg := o.Pkg()
++					ptype := g.pkgName(oPkg) + o.Name()
++					g.genToArrayRefNum(toVar, fromVar, ptype)
++				default:
++					g.errorf("unsupported type: %s", t)
++				}
++			default:
++				g.errorf("unsupported type: %s", t)
++			}
+ 		}
+-		g.errorf("unsupported type: %s", t)
+ 	case *types.Pointer:
+ 		// TODO(crawshaw): test *int
+ 		// TODO(crawshaw): test **Generator
+@@ -129,6 +143,8 @@ func (g *goGen) genWrite(toVar, fromVar string, t types.Type, mode varMode) {
+ 		switch u := t.Underlying().(type) {
+ 		case *types.Interface, *types.Pointer:
+ 			g.genToRefNum(toVar, fromVar)
++		case *types.Basic:
++			g.genWrite(toVar, fromVar, u, mode)
+ 		default:
+ 			g.errorf("unsupported, direct named type %s: %s", t, u)
+ 		}
+@@ -147,6 +163,17 @@ func (g *goGen) genToRefNum(toVar, fromVar string) {
+ 	g.Printf("}\n")
+ }
+ 
++// genToRefNum generates Go code for converting a variable to its refnum.
++// Note that the nil-check cannot be lifted into seq.ToRefNum, because a nil
++// struct pointer does not convert to a nil interface.
++func (g *goGen) genToArrayRefNum(toVar, fromVar, ptype string) {
++	g.Printf("var %s C.int32_t = _seq.NullRefNum\n", toVar)
++	g.Printf("if %s != nil {\n", fromVar)
++	g.Printf("	a := NewGoArrayWrapper[%s](%s) \n", ptype, fromVar)
++	g.Printf("	%s = C.int32_t(_seq.ToRefNum(a))\n", toVar)
++	g.Printf("}\n")
++}
++
+ func (g *goGen) genFuncSignature(o *types.Func, objName string) {
+ 	g.Printf("//export proxy%s_%s_%s\n", g.pkgPrefix, objName, o.Name())
+ 	g.Printf("func proxy%s_%s_%s(", g.pkgPrefix, objName, o.Name())
+@@ -392,8 +419,32 @@ func (g *goGen) genRead(toVar, fromVar string, typ types.Type, mode varMode) {
+ 		if isBytesSlice(t) {
+ 			g.Printf("%s := toSlice(%s, %v)\n", toVar, fromVar, mode == modeRetained)
+ 			return
++		} else {
++			switch e := t.Elem().(type) {
++			case *types.Pointer:
++				switch u := e.Elem().(type) {
++				case *types.Named:
++					o := u.Obj()
++					oPkg := o.Pkg()
++					if !g.validPkg(oPkg) {
++						g.errorf("type %s is defined in %s, which is not bound", u, oPkg)
++						return
++					}
++					g.Printf("// Must be a Go object\n")
++					g.Printf("var %s []*%s%s\n", toVar, g.pkgName(oPkg), o.Name())
++					g.Printf("if %s_ref := _seq.FromRefNum(int32(%s)); %s_ref != nil {\n", toVar, fromVar, toVar)
++					g.Printf("  if %s_wrapper := %s_ref.Get().(*GOArrayWrapper); %s_wrapper != nil {\n", toVar, toVar, toVar)
++					g.Printf("		%s = ExtractGoArray[%s%s](%s_wrapper) \n", toVar, g.pkgName(oPkg), o.Name(), toVar)
++					g.Printf("	}\n")
++					g.Printf("}\n")
++					return
++				default:
++					g.errorf("unsupported pointer type %s", u)
++				}
++			default:
++				g.errorf("unsupported type: %s", t)
++			}
+ 		}
+-		g.errorf("unsupported type: %s", t)
+ 	case *types.Pointer:
+ 		switch u := types.Unalias(t.Elem()).(type) {
+ 		case *types.Named:
+@@ -412,7 +463,7 @@ func (g *goGen) genRead(toVar, fromVar string, typ types.Type, mode varMode) {
+ 			g.errorf("unsupported pointer type %s", t)
+ 		}
+ 	case *types.Named:
+-		switch t.Underlying().(type) {
++		switch u := t.Underlying().(type) {
+ 		case *types.Interface, *types.Pointer:
+ 			hasProxy := true
+ 			if iface, ok := t.Underlying().(*types.Interface); ok {
+@@ -448,6 +499,15 @@ func (g *goGen) genRead(toVar, fromVar string, typ types.Type, mode varMode) {
+ 			}
+ 			g.Printf("	}\n")
+ 			g.Printf("}\n")
++		case *types.Basic:
++			switch u.Kind() {
++			case types.String:
++				g.Printf("%s := decodeString(%s)\n", toVar, fromVar)
++			case types.Bool:
++				g.Printf("%s := %s != 0\n", toVar, fromVar)
++			default:
++				g.Printf("%s := %s.%s(%s)\n", toVar, g.pkgPrefix, t.Obj().Name(), fromVar)
++			}
+ 		default:
+ 			g.errorf("unsupported named type %s", t)
+ 		}
+@@ -471,11 +531,15 @@ func (g *goGen) typeString(typ types.Type) string {
+ 			return "TODO"
+ 		}
+ 
+-		switch t.Underlying().(type) {
++		switch u := t.Underlying().(type) {
+ 		case *types.Interface, *types.Struct:
+ 			return fmt.Sprintf("%s%s", g.pkgName(oPkg), types.TypeString(typ, types.RelativeTo(oPkg)))
++		case *types.Basic:
++			if ok, _ := g.isAlias(t); ok {
++				return fmt.Sprintf("%s%s", g.pkgName(oPkg), types.TypeString(typ, types.RelativeTo(oPkg)))
++			}
+ 		default:
+-			g.errorf("unsupported named type %s / %T", t, t)
++			g.errorf("unsupported named type %s / %T", t, u)
+ 		}
+ 	case *types.Pointer:
+ 		switch t := types.Unalias(t.Elem()).(type) {
+@@ -484,6 +548,15 @@ func (g *goGen) typeString(typ types.Type) string {
+ 		default:
+ 			g.errorf("not yet supported, pointer type %s / %T", t, t)
+ 		}
++	case *types.Slice:
++		switch e := t.Elem().(type) {
++		case *types.Basic:
++			return types.TypeString(typ, types.RelativeTo(pkg))
++		case *types.Pointer:
++			return "[]" + g.typeString(e)
++		default:
++			g.errorf("not yet supported, pointer type %s / %T", t, t)
++		}
+ 	default:
+ 		return types.TypeString(typ, types.RelativeTo(pkg))
+ 	}
+diff --git a/bind/genjava.go b/bind/genjava.go
+index ce02bf7..6c0f7ea 100644
+--- a/bind/genjava.go
++++ b/bind/genjava.go
+@@ -13,6 +13,7 @@ import (
+ 	"reflect"
+ 	"regexp"
+ 	"strings"
++	"unicode"
+ 
+ 	"golang.org/x/mobile/internal/importers/java"
+ )
+@@ -314,9 +315,9 @@ func (g *JavaGen) genStruct(s structInfo) {
+ 
+ 		fdoc := doc.Member(f.Name())
+ 		g.javadoc(fdoc)
+-		g.Printf("public final native %s get%s();\n", g.javaType(f.Type()), f.Name())
++		g.Printf("public final native %s %sGet();\n", g.javaType(f.Type()), toLowerFirst(f.Name()))
+ 		g.javadoc(fdoc)
+-		g.Printf("public final native void set%s(%s v);\n\n", f.Name(), g.javaType(f.Type()))
++		g.Printf("public final native void %sSet(%s v);\n\n", toLowerFirst(f.Name()), g.javaType(f.Type()))
+ 	}
+ 
+ 	var isStringer bool
+@@ -487,9 +488,9 @@ func (g *JavaGen) genObjectMethods(n string, fields []*types.Var, isStringer boo
+ 			continue
+ 		}
+ 		nf := f.Name()
+-		g.Printf("%s this%s = get%s();\n", g.javaType(f.Type()), nf, nf)
+-		g.Printf("%s that%s = that.get%s();\n", g.javaType(f.Type()), nf, nf)
+-		if isJavaPrimitive(f.Type()) {
++		g.Printf("%s this%s = %sGet();\n", g.javaType(f.Type()), nf, toLowerFirst(nf))
++		g.Printf("%s that%s = that.%sGet();\n", g.javaType(f.Type()), nf, toLowerFirst(nf))
++		if g.isJavaPrimitive(f.Type()) {
+ 			g.Printf("if (this%s != that%s) {\n    return false;\n}\n", nf, nf)
+ 		} else {
+ 			g.Printf("if (this%s == null) {\n", nf)
+@@ -514,7 +515,7 @@ func (g *JavaGen) genObjectMethods(n string, fields []*types.Var, isStringer boo
+ 			g.Printf(", ")
+ 		}
+ 		idx++
+-		g.Printf("get%s()", f.Name())
++		g.Printf("%sGet()", toLowerFirst(f.Name()))
+ 	}
+ 	g.Printf("});\n")
+ 	g.Printf("}\n\n")
+@@ -532,7 +533,7 @@ func (g *JavaGen) genObjectMethods(n string, fields []*types.Var, isStringer boo
+ 				continue
+ 			}
+ 			n := f.Name()
+-			g.Printf(`b.append("%s:").append(get%s()).append(",");`, n, n)
++			g.Printf(`b.append("%s:").append(%sGet()).append(",");`, n, toLowerFirst(n))
+ 			g.Printf("\n")
+ 		}
+ 		g.Printf(`return b.append("}").toString();`)
+@@ -591,15 +592,18 @@ func (g *JavaGen) genInterface(iface interfaceInfo) {
+ 	g.Printf("}\n\n")
+ }
+ 
+-func isJavaPrimitive(T types.Type) bool {
+-	b, ok := T.(*types.Basic)
+-	if !ok {
+-		return false
+-	}
+-	switch b.Kind() {
+-	case types.Bool, types.Uint8, types.Float32, types.Float64,
+-		types.Int, types.Int8, types.Int16, types.Int32, types.Int64:
+-		return true
++func (g *JavaGen) isJavaPrimitive(T types.Type) bool {
++	switch T := T.(type) {
++	case *types.Basic:
++		switch T.Kind() {
++		case types.Bool, types.Uint8, types.Float32, types.Float64,
++			types.Int, types.Int8, types.Int16, types.Int32, types.Int64:
++			return true
++		}
++	case *types.Named:
++		if ok, subtype := g.isAlias(T); ok {
++			return g.isJavaPrimitive(subtype)
++		}
+ 	}
+ 	return false
+ }
+@@ -637,15 +641,22 @@ func (g *JavaGen) jniType(T types.Type) string {
+ 			return "TODO"
+ 		}
+ 	case *types.Slice:
++		switch T.Elem().(type) {
++		case *types.Pointer:
++			return "jobjectArray"
++		}
+ 		return "jbyteArray"
+-
+ 	case *types.Pointer:
+ 		if _, ok := types.Unalias(T.Elem()).(*types.Named); ok {
+ 			return g.jniType(T.Elem())
+ 		}
+ 		g.errorf("unsupported pointer to type: %s", T)
+ 	case *types.Named:
+-		return "jobject"
++		if ok, subtype := g.isAlias(T); ok {
++			return g.jniType(subtype)
++		} else {
++			return "jobject"
++		}
+ 	default:
+ 		g.errorf("unsupported jniType: %#+v, %s\n", T, T)
+ 	}
+@@ -706,21 +717,25 @@ func (g *JavaGen) javaType(T types.Type) string {
+ 		}
+ 		g.errorf("unsupported pointer to type: %s", T)
+ 	case *types.Named:
+-		n := T.Obj()
+-		nPkg := n.Pkg()
+-		if !isErrorType(T) && !g.validPkg(nPkg) {
+-			g.errorf("type %s is in %s, which is not bound", n.Name(), nPkg)
+-			break
+-		}
+-		// TODO(crawshaw): more checking here
+-		clsName := n.Name()
+-		if nPkg != g.Pkg {
+-			if clsName == JavaClassName(nPkg) {
+-				clsName += "_"
+-			}
+-			return fmt.Sprintf("%s.%s", g.javaPkgName(nPkg), clsName)
++		if ok, subtype := g.isAlias(T); ok {
++			return g.javaType(subtype)
+ 		} else {
+-			return g.javaTypeName(clsName)
++			n := T.Obj()
++			nPkg := n.Pkg()
++			if !isErrorType(T) && !g.validPkg(nPkg) {
++				g.errorf("type %s is in %s, which is not bound", n.Name(), nPkg)
++				break
++			}
++			// TODO(crawshaw): more checking here
++			clsName := n.Name()
++			if nPkg != g.Pkg {
++				if clsName == JavaClassName(nPkg) {
++					clsName += "_"
++				}
++				return fmt.Sprintf("%s.%s", g.javaPkgName(nPkg), clsName)
++			} else {
++				return g.javaTypeName(clsName)
++			}
+ 		}
+ 	default:
+ 		g.errorf("unsupported javaType: %#+v, %s\n", T, T)
+@@ -866,11 +881,11 @@ func (g *JavaGen) genVar(o *types.Var) {
+ 	doc := g.docs[o.Name()].Doc()
+ 	// setter
+ 	g.javadoc(doc)
+-	g.Printf("public static native void set%s(%s v);\n", o.Name(), jType)
++	g.Printf("public static native void %sSet(%s v);\n", toLowerFirst(o.Name()), jType)
+ 
+ 	// getter
+ 	g.javadoc(doc)
+-	g.Printf("public static native %s get%s();\n\n", jType, o.Name())
++	g.Printf("public static native %s %sGet();\n\n", jType, toLowerFirst(o.Name()))
+ }
+ 
+ // genCRetClear clears the result value from a JNI call if an exception was
+@@ -905,15 +920,31 @@ func (g *JavaGen) genJavaToC(varName string, t types.Type, mode varMode) {
+ 	case *types.Slice:
+ 		if isBytesSlice(t) {
+ 			g.Printf("nbyteslice _%s = go_seq_from_java_bytearray(env, %s, %d);\n", varName, varName, toCFlag(mode == modeRetained))
+-			return
++		} else {
++			switch t.Elem().(type) {
++			case *types.Pointer:
++				g.Printf("int32_t _%s = go_seq_from_java_array(env, %s);\n", varName, varName)
++			default:
++				g.errorf("TODO: unsupported type: %s", t)
++			}
+ 		}
+-		g.errorf("unsupported type: %s", t)
+ 	case *types.Named:
+-		switch u := t.Underlying().(type) {
+-		case *types.Interface:
+-			g.Printf("int32_t _%s = go_seq_to_refnum(env, %s);\n", varName, varName)
+-		default:
+-			g.errorf("unsupported named type: %s / %T", u, u)
++		if ok, subtype := g.isAlias(t); ok {
++			g.genJavaToC(varName, subtype, mode)
++		} else {
++			st := t.Underlying()
++			switch u := st.(type) {
++			case *types.Interface:
++				g.Printf("int32_t _%s = go_seq_to_refnum(env, %s);\n", varName, varName)
++			case *types.Basic:
++				if ok, subtype := g.isAlias(t); ok {
++					g.genJavaToC(varName, subtype, mode)
++				} else {
++					g.errorf("TODO: unsupported named type: %s / %T", u, u)
++				}
++			default:
++				g.errorf("TODO: unsupported named type: %s / %T", u, u)
++			}
+ 		}
+ 	case *types.Pointer:
+ 		g.Printf("int32_t _%s = go_seq_to_refnum(env, %s);\n", varName, varName)
+@@ -936,9 +967,19 @@ func (g *JavaGen) genCToJava(toName, fromName string, t types.Type, mode varMode
+ 	case *types.Slice:
+ 		if isBytesSlice(t) {
+ 			g.Printf("jbyteArray %s = go_seq_to_java_bytearray(env, %s, %d);\n", toName, fromName, toCFlag(mode == modeRetained))
+-			return
++		} else {
++			switch e := t.Elem().(type) {
++			case *types.Pointer:
++				switch e := e.Elem().(type) {
++				case *types.Named:
++					g.genArrayFromRefnum(toName, fromName, e, e.Obj())
++				default:
++					g.errorf("TODO: unsupported type %s", t)
++				}
++			default:
++				g.errorf("unsupported type: %s", t)
++			}
+ 		}
+-		g.errorf("unsupported type: %s", t)
+ 	case *types.Pointer:
+ 		// TODO(crawshaw): test *int
+ 		// TODO(crawshaw): test **Generator
+@@ -949,11 +990,21 @@ func (g *JavaGen) genCToJava(toName, fromName string, t types.Type, mode varMode
+ 			g.errorf("unsupported type %s", t)
+ 		}
+ 	case *types.Named:
+-		switch t.Underlying().(type) {
+-		case *types.Interface, *types.Pointer:
+-			g.genFromRefnum(toName, fromName, t, t.Obj())
+-		default:
+-			g.errorf("unsupported, direct named type %s", t)
++		if ok, subtype := g.isAlias(t); ok {
++			g.genCToJava(toName, fromName, subtype, mode)
++		} else {
++			switch t.Underlying().(type) {
++			case *types.Interface, *types.Pointer:
++				g.genFromRefnum(toName, fromName, t, t.Obj())
++			case *types.Basic:
++				if ok, subtype := g.isAlias(t); ok {
++					g.genCToJava(toName, fromName, subtype, mode)
++				} else {
++					g.errorf("TODO:unsupported, direct named type %s", t)
++				}
++			default:
++				g.errorf("TODO:unsupported, direct named type %s", t)
++			}
+ 		}
+ 	default:
+ 		g.Printf("%s %s = (%s)%s;\n", g.jniType(t), toName, g.jniType(t), fromName)
+@@ -977,6 +1028,23 @@ func (g *JavaGen) genFromRefnum(toName, fromName string, t types.Type, o *types.
+ 	g.Printf(");\n")
+ }
+ 
++func (g *JavaGen) genArrayFromRefnum(toName, fromName string, t types.Type, o *types.TypeName) {
++	oPkg := o.Pkg()
++	isJava := isJavaType(o.Type())
++	if !isErrorType(o.Type()) && !g.validPkg(oPkg) && !isJava {
++		g.errorf("type %s is defined in package %s, which is not bound", t, oPkg)
++		return
++	}
++	p := pkgPrefix(oPkg)
++	g.Printf("jobjectArray %s = go_seq_to_java_array(env, %s, ", toName, fromName)
++	if isJava {
++		g.Printf("NULL, NULL")
++	} else {
++		g.Printf("proxy_class_%s_%s, proxy_class_%s_%s_cons", p, o.Name(), p, o.Name())
++	}
++	g.Printf(");\n")
++}
++
+ func (g *JavaGen) gobindOpts() string {
+ 	opts := []string{"-lang=java"}
+ 	if g.JavaPkg != "" {
+@@ -1026,15 +1094,23 @@ func JavaClassName(pkg *types.Package) string {
+ }
+ 
+ func (g *JavaGen) genConst(o *types.Const) {
+-	if _, ok := o.Type().(*types.Basic); !ok || !g.isSupported(o.Type()) {
++	goType := o.Type()
++	if t, ok := goType.(*types.Named); ok {
++		if ok, subtype := g.isAlias(t); ok {
++			goType = subtype
++		}
++	}
++	if _, ok := goType.(*types.Basic); !ok || !g.isSupported(goType) {
+ 		g.Printf("// skipped const %s with unsupported type: %s\n\n", o.Name(), o.Type())
+ 		return
+ 	}
++
+ 	// TODO(hyangah): should const names use upper cases + "_"?
+ 	// TODO(hyangah): check invalid names.
+-	jType := g.javaType(o.Type())
++	jType := g.javaType(goType)
+ 	val := o.Val().ExactString()
+-	switch b := o.Type().(*types.Basic); b.Kind() {
++
++	switch b := goType.(*types.Basic); b.Kind() {
+ 	case types.Int64, types.UntypedInt:
+ 		i, exact := constant.Int64Val(o.Val())
+ 		if !exact {
+@@ -1067,7 +1143,7 @@ func (g *JavaGen) genJNIField(o *types.TypeName, f *types.Var) {
+ 	n := java.JNIMangle(g.javaTypeName(o.Name()))
+ 	// setter
+ 	g.Printf("JNIEXPORT void JNICALL\n")
+-	g.Printf("Java_%s_%s_set%s(JNIEnv *env, jobject this, %s v) {\n", g.jniPkgName(), n, java.JNIMangle(f.Name()), g.jniType(f.Type()))
++	g.Printf("Java_%s_%s_%sSet(JNIEnv *env, jobject this, %s v) {\n", g.jniPkgName(), n, toLowerFirst(java.JNIMangle(f.Name())), g.jniType(f.Type()))
+ 	g.Indent()
+ 	g.Printf("int32_t o = go_seq_to_refnum_go(env, this);\n")
+ 	g.genJavaToC("v", f.Type(), modeRetained)
+@@ -1078,7 +1154,7 @@ func (g *JavaGen) genJNIField(o *types.TypeName, f *types.Var) {
+ 
+ 	// getter
+ 	g.Printf("JNIEXPORT %s JNICALL\n", g.jniType(f.Type()))
+-	g.Printf("Java_%s_%s_get%s(JNIEnv *env, jobject this) {\n", g.jniPkgName(), n, java.JNIMangle(f.Name()))
++	g.Printf("Java_%s_%s_%sGet(JNIEnv *env, jobject this) {\n", g.jniPkgName(), n, toLowerFirst(java.JNIMangle(f.Name())))
+ 	g.Indent()
+ 	g.Printf("int32_t o = go_seq_to_refnum_go(env, this);\n")
+ 	g.Printf("%s r0 = ", g.cgoType(f.Type()))
+@@ -1097,20 +1173,20 @@ func (g *JavaGen) genJNIVar(o *types.Var) {
+ 	n := java.JNIMangle(g.javaTypeName(o.Name()))
+ 	// setter
+ 	g.Printf("JNIEXPORT void JNICALL\n")
+-	g.Printf("Java_%s_%s_set%s(JNIEnv *env, jclass clazz, %s v) {\n", g.jniPkgName(), java.JNIMangle(g.className()), n, g.jniType(o.Type()))
++	g.Printf("Java_%s_%s_%sSet(JNIEnv *env, jclass clazz, %s v) {\n", g.jniPkgName(), toLowerFirst(java.JNIMangle(g.className())), n, g.jniType(o.Type()))
+ 	g.Indent()
+ 	g.genJavaToC("v", o.Type(), modeRetained)
+-	g.Printf("var_set%s_%s(_v);\n", g.pkgPrefix, o.Name())
++	g.Printf("var_%sSet_%s(_v);\n", g.pkgPrefix, o.Name())
+ 	g.genRelease("v", o.Type(), modeRetained)
+ 	g.Outdent()
+ 	g.Printf("}\n\n")
+ 
+ 	// getter
+ 	g.Printf("JNIEXPORT %s JNICALL\n", g.jniType(o.Type()))
+-	g.Printf("Java_%s_%s_get%s(JNIEnv *env, jclass clazz) {\n", g.jniPkgName(), java.JNIMangle(g.className()), n)
++	g.Printf("Java_%s_%s_%sGet(JNIEnv *env, jclass clazz) {\n", g.jniPkgName(), toLowerFirst(java.JNIMangle(g.className())), n)
+ 	g.Indent()
+ 	g.Printf("%s r0 = ", g.cgoType(o.Type()))
+-	g.Printf("var_get%s_%s();\n", g.pkgPrefix, o.Name())
++	g.Printf("var_%sGet_%s();\n", toLowerFirst(g.pkgPrefix), o.Name())
+ 	g.genCToJava("_r0", "r0", o.Type(), modeRetained)
+ 	g.Printf("return _r0;\n")
+ 	g.Outdent()
+@@ -1374,7 +1450,11 @@ func (g *JavaGen) jniCallType(t types.Type) string {
+ 		}
+ 		g.errorf("unsupported pointer to type: %s", t)
+ 	case *types.Named:
+-		return "Object"
++		if ok, subtype := g.isAlias(t); ok {
++			return g.jniCallType(subtype)
++		} else {
++			return "Object"
++		}
+ 	default:
+ 		return "Object"
+ 	}
+@@ -1424,7 +1504,11 @@ func (g *JavaGen) jniSigType(T types.Type) string {
+ 		}
+ 		g.errorf("unsupported pointer to type: %s", T)
+ 	case *types.Named:
+-		return "L" + g.jniClassSigPrefix(T.Obj().Pkg()) + g.javaTypeName(T.Obj().Name()) + ";"
++		if ok, subtype := g.isAlias(T); ok {
++			return g.jniSigType(subtype)
++		} else {
++			return "L" + g.jniClassSigPrefix(T.Obj().Pkg()) + g.javaTypeName(T.Obj().Name()) + ";"
++		}
+ 	default:
+ 		g.errorf("unsupported jniType: %#+v, %s\n", T, T)
+ 	}
+@@ -1678,6 +1762,12 @@ func isJavaType(t types.Type) bool {
+ 	return typePkgFirstElem(t) == "Java"
+ }
+ 
++func toLowerFirst(MyStr string) string {
++	runes := []rune(MyStr)
++	runes[0] = unicode.ToLower(runes[0])
++	return string(runes)
++}
++
+ const (
+ 	javaPreamble = gobindPreamble + `// Java class %[1]s.%[2]s is a proxy for talking to a Go program.
+ //
+diff --git a/bind/genobjc.go b/bind/genobjc.go
+index 683df99..4ccc017 100644
+--- a/bind/genobjc.go
++++ b/bind/genobjc.go
+@@ -161,7 +161,14 @@ func (g *ObjcGen) GenH() error {
+ 			}
+ 		}
+ 	}
+-	g.Printf("\n")
++
++	// Generating aliases as typedef
++	for _, a := range g.aliases {
++		g.Printf("typedef %s %s%s;\n", g.objcType(a.t), g.namePrefix, a.obj.Name())
++	}
++	if len(g.aliases) > 0 {
++		g.Printf("\n")
++	}
+ 
+ 	// Forward declaration of @class and @protocol
+ 	for _, s := range g.structs {
+@@ -191,12 +198,21 @@ func (g *ObjcGen) GenH() error {
+ 	// const
+ 	// TODO: prefix with k?, or use a class method?
+ 	for _, obj := range g.constants {
+-		if _, ok := obj.Type().(*types.Basic); !ok || !g.isSupported(obj.Type()) {
++		var bt *types.Basic
++		if t, ok := obj.Type().(*types.Basic); ok {
++			bt = t
++		} else if t, ok := obj.Type().(*types.Named); ok {
++			if ok, subtype := g.isAlias(t); ok {
++				bt = subtype
++			}
++		}
++
++		if bt == nil || !g.isSupported(bt) {
+ 			g.Printf("// skipped const %s with unsupported type: %s\n\n", obj.Name(), obj.Type())
+ 			continue
+ 		}
+ 		g.objcdoc(g.docs[obj.Name()].Doc())
+-		switch b := obj.Type().(*types.Basic); b.Kind() {
++		switch bt.Kind() {
+ 		case types.String, types.UntypedString:
+ 			g.Printf("FOUNDATION_EXPORT NSString* _Nonnull const %s%s;\n", g.namePrefix, obj.Name())
+ 		default:
+@@ -365,14 +381,23 @@ func (g *ObjcGen) genVarM(o *types.Var) {
+ }
+ 
+ func (g *ObjcGen) genConstM(o *types.Const) {
+-	if _, ok := o.Type().(*types.Basic); !ok || !g.isSupported(o.Type()) {
++	var b *types.Basic
++	if t, ok := o.Type().(*types.Basic); ok {
++		b = t
++	} else if t, ok := o.Type().(*types.Named); ok {
++		if ok, subtype := g.isAlias(t); ok {
++			b = subtype
++		}
++	}
++
++	if b == nil || !g.isSupported(b) {
+ 		g.Printf("// skipped const %s with unsupported type: %s\n\n", o.Name(), o.Type())
+ 		return
+ 	}
+ 	cName := fmt.Sprintf("%s%s", g.namePrefix, o.Name())
+ 	objcType := g.objcType(o.Type())
+ 
+-	switch b := o.Type().(*types.Basic); b.Kind() {
++	switch b.Kind() {
+ 	case types.Bool, types.UntypedBool:
+ 		v := "NO"
+ 		if constant.BoolVal(o.Val()) {
+@@ -690,13 +715,25 @@ func (g *ObjcGen) genWrite(varName string, t types.Type, mode varMode) {
+ 	case *types.Slice:
+ 		if isBytesSlice(t) {
+ 			g.Printf("nbyteslice _%s = go_seq_from_objc_bytearray(%s, %d);\n", varName, varName, toCFlag(mode == modeRetained))
+-			return
++		} else {
++			switch e := t.Elem().(type) {
++			case *types.Pointer:
++				g.genArrayRefWrite(varName, e)
++			default:
++				g.errorf("unsupported type: %s", t)
++			}
+ 		}
+-		g.errorf("unsupported type: %s", t)
+ 	case *types.Named:
+ 		switch u := t.Underlying().(type) {
+ 		case *types.Interface:
+ 			g.genRefWrite(varName)
++		case *types.Basic:
++			switch u.Kind() {
++			case types.String:
++				g.Printf("%s _%s = go_seq_from_objc_string(%s);\n", g.objcType(t), varName, varName)
++			default:
++				g.Printf("%s _%s = (%s)%s;\n", g.objcType(t), varName, g.objcType(t), varName)
++			}
+ 		default:
+ 			g.errorf("unsupported named type: %s / %T", u, u)
+ 		}
+@@ -721,6 +758,12 @@ func (g *ObjcGen) genRefWrite(varName string) {
+ 	g.Printf("}\n")
+ }
+ 
++func (g *ObjcGen) genArrayRefWrite(varName string, t types.Type) {
++	ptype := g.refTypeBase(t)
++	g.Printf("NSArrayWrapper<%s *> * %s_wrapper = [[NSArrayWrapper<%s *> alloc] initWithArray:%s];\n", ptype, varName, ptype, varName)
++	g.Printf("int32_t _%s = go_seq_go_to_refnum(%s_wrapper._ref);\n", varName, varName)
++}
++
+ func (g *ObjcGen) genRefRead(toName, fromName string, t types.Type) {
+ 	ptype := g.refTypeBase(t)
+ 	g.Printf("%s* %s = nil;\n", ptype, toName)
+@@ -737,6 +780,23 @@ func (g *ObjcGen) genRefRead(toName, fromName string, t types.Type) {
+ 	g.Printf("}\n")
+ }
+ 
++func (g *ObjcGen) genArrayRefRead(toName, fromName string, t types.Type) {
++	ptype := g.refTypeBase(t)
++	g.Printf("NSArray<%s *> * %s = nil;\n", ptype, toName)
++	g.Printf("GoSeqRef* %s_ref = go_seq_from_refnum(%s);\n", toName, fromName)
++	g.Printf("if (%s_ref != NULL) {\n", toName)
++	g.Printf("	%s = %s_ref.obj;\n", toName, toName)
++	g.Printf("	if (%s == nil) {\n", toName)
++	if isObjcType(t) {
++		g.Printf("		LOG_FATAL(@\"unexpected NULL reference\");\n")
++	} else {
++		g.Printf("		NSArrayWrapper<%s *> *%s_wrapper = [[NSArrayWrapper<%s *> alloc] initWithRef:%s_ref];\n", ptype, toName, ptype, toName)
++		g.Printf("		%s = [%s_wrapper array:[%s class]];\n", toName, toName, ptype)
++	}
++	g.Printf("	}\n")
++	g.Printf("}\n")
++}
++
+ func (g *ObjcGen) genRead(toName, fromName string, t types.Type, mode varMode) {
+ 	switch t := types.Unalias(t).(type) {
+ 	case *types.Basic:
+@@ -751,9 +811,14 @@ func (g *ObjcGen) genRead(toName, fromName string, t types.Type, mode varMode) {
+ 	case *types.Slice:
+ 		if isBytesSlice(t) {
+ 			g.Printf("NSData *%s = go_seq_to_objc_bytearray(%s, %d);\n", toName, fromName, toCFlag(mode == modeRetained))
+-			return
++		} else {
++			switch e := t.Elem().(type) {
++			case *types.Pointer:
++				g.genArrayRefRead(toName, fromName, e)
++			default:
++				g.errorf("unsupported type: %s", t)
++			}
+ 		}
+-		g.errorf("unsupported type: %s", t)
+ 	case *types.Pointer:
+ 		switch t := types.Unalias(t.Elem()).(type) {
+ 		case *types.Named:
+@@ -762,9 +827,18 @@ func (g *ObjcGen) genRead(toName, fromName string, t types.Type, mode varMode) {
+ 			g.errorf("unsupported type %s", t)
+ 		}
+ 	case *types.Named:
+-		switch t.Underlying().(type) {
++		switch u := t.Underlying().(type) {
+ 		case *types.Interface, *types.Pointer:
+ 			g.genRefRead(toName, fromName, t)
++		case *types.Basic:
++			switch u.Kind() {
++			case types.String:
++				g.Printf("%s *%s = go_seq_to_objc_string(%s);\n", g.objcType(t), toName, fromName)
++			case types.Bool:
++				g.Printf("%s %s = %s ? YES : NO;\n", g.objcType(t), toName, fromName)
++			default:
++				g.Printf("%s %s = (%s)%s;\n", g.objcType(t), toName, g.objcType(t), fromName)
++			}
+ 		default:
+ 			g.errorf("unsupported, direct named type %s", t)
+ 		}
+@@ -1324,13 +1398,20 @@ func (g *ObjcGen) objcType(typ types.Type) string {
+ 			return "TODO"
+ 		}
+ 	case *types.Slice:
+-		elem := g.objcType(typ.Elem())
+-		// Special case: NSData seems to be a better option for byte slice.
+-		if elem == "byte" {
+-			return "NSData* _Nullable"
++		switch e := typ.Elem().(type) {
++		case *types.Basic:
++			switch e.Kind() {
++			case types.Uint8:
++				// Special case: NSData seems to be a better option for byte slice.
++				return "NSData* _Nullable"
++			default:
++				g.errorf("unsupported slice type: %s", typ)
++			}
++		case *types.Named:
++			return "NSArray<" + g.objcType(e) + " *> *"
++		case *types.Pointer:
++			return "NSArray<" + g.objcType(e.Elem()) + " *> * _Nullable"
+ 		}
+-		// TODO(hyangah): support other slice types: NSArray or CFArrayRef.
+-		// Investigate the performance implication.
+ 		g.errorf("unsupported type: %s", typ)
+ 		return "TODO"
+ 	case *types.Pointer:
+@@ -1358,6 +1439,10 @@ func (g *ObjcGen) objcType(typ types.Type) string {
+ 			}
+ 		case *types.Struct:
+ 			return g.namePrefixOf(n.Pkg()) + n.Name()
++		case *types.Basic:
++			if g.isSupported(t) {
++				return g.namePrefixOf(n.Pkg()) + n.Name()
++			}
+ 		}
+ 		g.errorf("unsupported, named type %s", typ)
+ 		return "TODO"
+diff --git a/bind/java/seq_android.c.support b/bind/java/seq_android.c.support
+index 77ec5f4..ee19aed 100644
+--- a/bind/java/seq_android.c.support
++++ b/bind/java/seq_android.c.support
+@@ -93,6 +93,31 @@ jbyteArray go_seq_to_java_bytearray(JNIEnv *env, nbyteslice s, int copy) {
+ 	return res;
+ }
+ 
++jobjectArray go_seq_to_java_array(JNIEnv *env, int32_t refnum, jclass proxy_class, jmethodID proxy_cons) {
++    if (refnum == NULL_REFNUM) {
++		return NULL;
++	}
++
++    IncGoRef(refnum);
++    int size = proxyseq_array_wrapper_length(refnum);
++	jobjectArray res = (*env)->NewObjectArray(env, size, proxy_class, NULL);
++
++	if (res == NULL) {
++		LOG_FATAL("NewObjectArray failed");
++	}
++
++    for (int i = 0; i < size; i++) {
++        if (i < size - 1) {
++            IncGoRef(refnum);
++        }
++        int32_t objectId = proxyseq_array_wrapper_value_at_index(refnum, i);
++        (*env)->SetObjectArrayElement(env, res, i, go_seq_from_refnum(env, objectId, proxy_class, proxy_cons));
++    }
++
++	return res;
++}
++
++
+ #define surr1 0xd800
+ #define surr2 0xdc00
+ #define surr3 0xe000
+@@ -224,6 +249,29 @@ nbyteslice go_seq_from_java_bytearray(JNIEnv *env, jbyteArray arr, int copy) {
+ 	return res;
+ }
+ 
++int32_t go_seq_from_java_array(JNIEnv *env, jobjectArray arr) {
++    int32_t refnum = new_go_array_wrapper();
++
++	if (arr == NULL) {
++		return refnum;
++	}
++
++	jsize len = (*env)->GetArrayLength(env, arr);
++	if (len == 0) {
++		return refnum;
++	}
++
++	for (int i = 0; i < len; i++) {
++	    LOG_INFO("test 10");
++	    int32_t objectId = go_seq_to_refnum_go(env, (*env)->GetObjectArrayElement(env, arr, i));
++	    IncGoRef(refnum);
++	    proxyseq_array_wrapper_append_ref_value(refnum, objectId);
++	    LOG_INFO("test 11");
++	}
++
++	return refnum;
++}
++
+ int32_t go_seq_to_refnum_go(JNIEnv *env, jobject o) {
+ 	if (o == NULL) {
+ 		return NULL_REFNUM;
+diff --git a/bind/java/seq_android.h b/bind/java/seq_android.h
+index 26e9025..1110043 100644
+--- a/bind/java/seq_android.h
++++ b/bind/java/seq_android.h
+@@ -26,10 +26,17 @@ typedef struct nstring {
+ 	// length in bytes, regardless of encoding
+ 	jsize len;
+ } nstring;
++
+ typedef struct nbyteslice {
+ 	void *ptr;
+ 	jsize len;
+ } nbyteslice;
++
++typedef struct nobjectslice {
++	int32_t *ptr;
++	jsize len;
++} nobjectslice;
++
+ typedef jlong nint;
+ 
+ extern void go_seq_dec_ref(int32_t ref);
+@@ -52,6 +59,9 @@ extern void go_seq_release_byte_array(JNIEnv *env, jbyteArray arr, jbyte* ptr);
+ extern jstring go_seq_to_java_string(JNIEnv *env, nstring str);
+ extern nstring go_seq_from_java_string(JNIEnv *env, jstring s);
+ 
++extern jobjectArray go_seq_to_java_array(JNIEnv *env, int32_t refnum, jclass proxy_class, jmethodID proxy_cons);
++extern int32_t go_seq_from_java_array(JNIEnv *env, jobjectArray array);
++
+ // push_local_frame retrieves or creates the JNIEnv* for the current thread
+ // and pushes a JNI reference frame. Must be matched with call to pop_local_frame.
+ extern JNIEnv *go_seq_push_local_frame(jint cap);
+diff --git a/bind/objc/seq_darwin.h b/bind/objc/seq_darwin.h
+index 1aeec4a..c3aacaa 100644
+--- a/bind/objc/seq_darwin.h
++++ b/bind/objc/seq_darwin.h
+@@ -25,6 +25,17 @@
+                               userInfo:NULL];                                  \
+   }
+ 
++@interface NSArrayWrapper<T> : NSObject <goSeqRefInterface> {
++}
++
++@property(strong, readonly) id _ref;
++
++- (instancetype)initWithRef:(id)ref;
++- (instancetype)initWithArray:(NSArray<T> *)array;
++- (NSArray<T> *)array:(Class)class;
++
++@end
++
+ // Platform specific types
+ typedef struct nstring {
+ 	void *ptr;
+diff --git a/bind/objc/seq_darwin.m.support b/bind/objc/seq_darwin.m.support
+index 917a4ef..9ae0b4b 100644
+--- a/bind/objc/seq_darwin.m.support
++++ b/bind/objc/seq_darwin.m.support
+@@ -379,3 +379,57 @@ nstring go_seq_from_objc_string(NSString *s) {
+ }
+ 
+ @end
++
++@implementation NSArrayWrapper {
++}
++
++- (nonnull instancetype)initWithRef:(_Nonnull id)ref {
++	self = [super init];
++	if (self) { __ref = ref; }
++	return self;
++}
++
++- (nonnull instancetype)initWithArray:(NSArray *)array {
++    self = [super init];
++    if (self) {
++        __ref = go_seq_from_refnum(new_go_array_wrapper());
++    }
++    [self loadArray:array];
++    return self;
++}
++
++- (void)loadArray:(NSArray *)array {
++    for (id v in array) {
++       int32_t _v;
++       if ([v conformsToProtocol:@protocol(goSeqRefInterface)]) {
++    	    id<goSeqRefInterface> v_proxy = (id<goSeqRefInterface>)(v);
++    	    _v = go_seq_go_to_refnum(v_proxy._ref);
++       } else {
++    	    _v = go_seq_to_refnum(v);
++       }
++       int32_t refnum = go_seq_go_to_refnum(self._ref);
++       proxyseq_array_wrapper_append_ref_value(refnum , _v);
++    }
++}
++
++- (NSArray *)array:(Class)class {
++	int32_t refnum = go_seq_go_to_refnum(self._ref);
++	int length = proxyseq_array_wrapper_length(refnum);
++    NSMutableArray *array = [NSMutableArray arrayWithCapacity:length];
++    for (int i = 0; i < length; i++) {
++        refnum = go_seq_go_to_refnum(self._ref);
++        int32_t r0 = proxyseq_array_wrapper_value_at_index(refnum, i);
++        id _r0 = [NSNull null];
++        GoSeqRef* _r0_ref = go_seq_from_refnum(r0);
++        if (_r0_ref != NULL) {
++            _r0 = _r0_ref.obj;
++        	if (_r0 == nil) {
++        		_r0 = [[class alloc] initWithRef:_r0_ref];
++        	}
++        }
++        array[i] = _r0;
++    }
++    return array;
++}
++
++@end
+diff --git a/bind/seq.go.support b/bind/seq.go.support
+index 392ec09..7b1b13b 100644
+--- a/bind/seq.go.support
++++ b/bind/seq.go.support
+@@ -49,4 +49,73 @@ func IncGoRef(refnum C.int32_t) {
+ 	_seq.Inc(int32(refnum))
+ }
+ 
++type GOArrayWrapper struct {
++	arrayRefNum []int32
++}
++
++func NewGoArrayWrapper[T any](array []*T) *GOArrayWrapper {
++    _v := GOArrayWrapper{}
++    for _, v := range(array) {
++        var __v int32 = _seq.NullRefNum
++        if v != nil {
++        	__v = _seq.ToRefNum(v)
++        }
++        _v.arrayRefNum = append(_v.arrayRefNum, __v)
++    }
++    return &_v
++}
++
++func ExtractGoArray[T any](wrapper *GOArrayWrapper) []*T {
++	var _v []*T
++	for _, v := range(wrapper.arrayRefNum) {
++		var __v *T
++		if __v_ref := _seq.FromRefNum(v); __v_ref != nil {
++			if __v = __v_ref.Get().(*T) ; __v != nil {
++				_v = append(_v, __v)
++			}
++		}
++	}
++	return _v
++}
++
++func (gaw *GOArrayWrapper)length() int {
++	return len(gaw.arrayRefNum)
++}
++
++func (gaw *GOArrayWrapper)valueAtIndex(idx int) int32 {
++	return gaw.arrayRefNum[idx]
++}
++
++func (gaw *GOArrayWrapper)appendRefValue(refValue int32) {
++	gaw.arrayRefNum = append(gaw.arrayRefNum, refValue)
++}
++
++//export new_go_array_wrapper
++func new_go_array_wrapper() C.int32_t {
++	return C.int32_t(_seq.ToRefNum(new(GOArrayWrapper)))
++}
++
++//export proxyseq_array_wrapper_length
++func proxyseq_array_wrapper_length(refnum C.int32_t) C.int {
++    ref := _seq.FromRefNum(int32(refnum))
++	v := ref.Get().(*GOArrayWrapper)
++	_v := C.int(v.length())
++    return _v
++}
++
++//export proxyseq_array_wrapper_value_at_index
++func proxyseq_array_wrapper_value_at_index(refnum C.int32_t, index C.int) C.int32_t {
++    ref := _seq.FromRefNum(int32(refnum))
++	v := ref.Get().(*GOArrayWrapper)
++	_v := C.int32_t(v.valueAtIndex(int(index)))
++	return _v
++}
++
++//export proxyseq_array_wrapper_append_ref_value
++func proxyseq_array_wrapper_append_ref_value(refnum C.int32_t, refValue C.int32_t) {
++    ref := _seq.FromRefNum(int32(refnum))
++	v := ref.Get().(*GOArrayWrapper)
++	v.appendRefValue(int32(refValue))
++}
++
+ func main() {}
